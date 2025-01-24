@@ -1,0 +1,10 @@
+pystray
+sounddevice
+keyboard
+pillow
+pywin32
+comtypes
+tk
+olefile
+pycaw
+pyinstaller
