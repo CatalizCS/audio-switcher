@@ -19,6 +19,7 @@ import win32con
 import win32security
 import winreg
 import win32com.client
+import win32process
 
 
 class DeviceType(Enum):
@@ -114,6 +115,9 @@ class AudioSwitcher:
         self.force_start = False
         self.startup_enabled = self.is_startup_enabled()
 
+        # Add new attribute for process tracking
+        self._svcl_processes = set()
+
         # Now load config which may override defaults
         self.load_config()
 
@@ -135,15 +139,23 @@ class AudioSwitcher:
         try:
             logging.debug("Audio Switcher initialization started")
 
+            # Get application directory
+            if getattr(sys, 'frozen', False):
+                # Running as compiled
+                app_dir = os.path.dirname(sys.executable)
+                resources_dir = os.path.join(app_dir, 'resources')
+            else:
+                # Running as script
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+                resources_dir = os.path.join(app_dir, 'resources')
+
             # Check if soundvolumeview exists
-            self.soundvolumeview_path = os.path.join(
-                os.path.dirname(__file__), "svcl.exe"
-            )
+            self.soundvolumeview_path = os.path.join(resources_dir, "svcl.exe")
             if not os.path.exists(self.soundvolumeview_path):
                 logging.error(
-                    "soundvolumeview.exe not found. Please download it from https://www.nirsoft.net/utils/sound_volume_view.html"
+                    "svcl.exe not found. Please ensure it's in the resources folder."
                 )
-                raise FileNotFoundError("soundvolumeview.exe is required but not found")
+                raise FileNotFoundError("svcl.exe is required but not found")
 
             # Initialize notification system
             try:
@@ -441,7 +453,7 @@ class AudioSwitcher:
             device = self.devices[self.current_type][0]
             # Ensure both default and output device are changed
             self.set_default_audio_device(device)
-            self.update_tray_title(device)
+            self._refresh_interface()  # Force immediate update
             device_name = sd.query_devices(device["index"])["name"]
             self.show_notification(
                 "Switched Type", f"Changed to {self.current_type.value}: {device_name}"
@@ -473,7 +485,7 @@ class AudioSwitcher:
         device = current_devices[self.current_device_index[self.current_type]]
         device_idx = device["index"]
         self.set_default_audio_device(device)
-        self.update_tray_title(device)
+        self._refresh_interface()  # Force immediate update
         device_name = sd.query_devices(device_idx)["name"]
         self.show_notification(
             f"Switched {self.current_type.value}", f"Now using: {device_name}"
@@ -551,51 +563,43 @@ class AudioSwitcher:
 
             logging.info(f"Setting default device: {device_name} (ID: {device_id})")
 
-            # Set as default for all roles
-            cmd_playback = [self.soundvolumeview_path, "/SetDefault", device_id, "all"]
-            logging.debug(f"Running command: {' '.join(cmd_playback)}")
+            # Set up process info
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = win32con.SW_HIDE
 
+            # Set as default for all roles in one command
+            cmd_playback = [self.soundvolumeview_path, "/SetDefault", device_id, "all"]
             result = subprocess.run(
-                cmd_playback, check=True, capture_output=True, text=True
+                cmd_playback,
+                check=True,
+                capture_output=True,
+                text=True,
+                startupinfo=startupinfo,
+                creationflags=win32process.CREATE_NO_WINDOW
             )
 
-            if result.stdout:
-                logging.debug(f"Command output: {result.stdout}")
-            if result.stderr:
-                logging.warning(f"Command stderr: {result.stderr}")
-
-            # Verify the change
-            verify_cmd = [self.soundvolumeview_path, "/scomma", "verify.csv"]
-            subprocess.run(verify_cmd, check=True, capture_output=True)
-
+            # Quick verification using Windows API
             try:
-                with open("verify.csv", "r") as f:
-                    current = f.read()
-                    if device_id not in current:
-                        logging.warning(
-                            "Device ID not found in current devices after setting"
-                        )
+                from pycaw.pycaw import AudioUtilities
+                devices = AudioUtilities.GetAllDevices()
+                default_device = next(
+                    (d for d in devices if d.id == device_id), None
+                )
+                if not default_device:
+                    logging.warning("Device not found in default devices after setting")
+                    return False
             except Exception as e:
-                logging.warning(f"Could not verify device change: {e}")
-            finally:
-                try:
-                    os.remove("verify.csv")
-                except:
-                    pass
+                logging.debug(f"Verification warning: {e}")
 
             logging.info(f"Successfully set {device_name} as default device")
             return True
 
         except subprocess.CalledProcessError as e:
             logging.error(f"SoundVolumeView failed: {e}")
-            logging.error(f"Command output: {e.stdout if e.stdout else 'No output'}")
-            logging.error(
-                f"Error output: {e.stderr if e.stderr else 'No error output'}"
-            )
             return False
         except Exception as e:
             logging.error(f"Error setting default device: {e}")
-            logging.error(f"Exception type: {type(e).__name__}")
             logging.error(traceback.format_exc())
             return False
 
@@ -603,13 +607,18 @@ class AudioSwitcher:
         try:
             logging.debug("Setting up system tray icon...")
 
-            # Enhanced icon setup
-            if not os.path.exists("icon.png"):
-                logging.error("icon.png not found in: " + os.path.abspath("icon.png"))
+            # Get icon path from resources
+            if getattr(sys, 'frozen', False):
+                icon_path = os.path.join(os.path.dirname(sys.executable), 'resources', 'icon.png')
+            else:
+                icon_path = os.path.join(os.path.dirname(__file__), 'resources', 'icon.png')
+
+            if not os.path.exists(icon_path):
+                logging.error("icon.png not found in: " + os.path.abspath(icon_path))
                 raise FileNotFoundError("icon.png is missing")
 
             try:
-                image = Image.open("icon.png")
+                image = Image.open(icon_path)
                 # Ensure icon is proper size
                 if image.size != (32, 32):
                     image = image.resize((32, 32), Image.Resampling.LANCZOS)
@@ -636,14 +645,6 @@ class AudioSwitcher:
                 f"Audio Switcher\n{self.current_type.value}: {current_device}",
                 menu,
             )
-
-            logging.debug("Creating tray menu...")
-            try:
-                menu = self.create_menu()
-                logging.debug("Menu structure created")
-            except Exception as e:
-                logging.error(f"Failed to create menu: {e}\n{traceback.format_exc()}")
-                raise
 
             logging.debug("Initializing system tray icon...")
             self.icon = pystray.Icon("audio_switcher", image, "Audio Switcher", menu)
@@ -694,12 +695,33 @@ class AudioSwitcher:
                 logging.info(f"Setting {device['name']} as default")
                 self.set_default_audio_device(device)
 
-            self.icon.update_menu()
-            if device_type == self.current_type:
-                self.update_tray_title(device)
+            # Force immediate menu update
+            self._refresh_interface()
 
         except Exception as e:
             logging.error(f"Error handling device click: {e}", exc_info=True)
+
+    def _refresh_interface(self):
+        """Force refresh of all UI elements"""
+        try:
+            # Update menu structure
+            menu = self.create_menu()
+            self.icon.menu = menu
+
+            # Force menu rebuild
+            self.icon.update_menu()
+
+            # Update current device in tray title
+            if self.devices[self.current_type]:
+                current_device = self.devices[self.current_type][self.current_device_index[self.current_type]]
+                self.update_tray_title(current_device)
+
+            # Force system tray refresh
+            self.icon.remove_notification()  # Clear any existing notifications
+            self.icon.visible = True  # Ensure icon is visible
+
+        except Exception as e:
+            logging.error(f"Error refreshing interface: {e}")
 
     def create_menu(self):
         try:
@@ -906,6 +928,19 @@ class AudioSwitcher:
         self._active = False
 
         try:
+            # Kill any remaining svcl processes
+            try:
+                # Force kill any remaining svcl processes
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "svcl.exe"],
+                    startupinfo=subprocess.STARTUPINFO(),
+                    creationflags=win32process.CREATE_NO_WINDOW,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL
+                )
+            except:
+                pass
+
             # Clean up notifications first to ensure proper shutdown
             if hasattr(self, "notifier"):
                 self.notifier.destroy()
@@ -988,6 +1023,7 @@ class AudioSwitcher:
 
             self.save_config()
             self.show_notification("Kernel Mode", message)
+            self._refresh_interface()
             self.icon.update_menu()
 
         except Exception as e:
@@ -1085,6 +1121,7 @@ class AudioSwitcher:
 
             self.startup_enabled = self.is_startup_enabled()
             self.show_notification("Startup Settings", message)
+            self._refresh_interface()
             self.icon.update_menu()
         except Exception as e:
             logging.error(f"Error toggling startup: {e}")
@@ -1104,6 +1141,7 @@ class AudioSwitcher:
 
             self.save_config()
             self.show_notification("Debug Mode", message)
+            self._refresh_interface()
             self.icon.update_menu()
         except Exception as e:
             print(f"Error toggling debug mode: {e}")

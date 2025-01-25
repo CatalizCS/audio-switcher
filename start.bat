@@ -55,18 +55,6 @@ echo [%date% %time%] Installing/Updating pip... >> "%LOG_FILE%"
 echo [%date% %time%] Installing requirements... >> "%LOG_FILE%"
 "%PYTHON_DIR%\python.exe" -m pip install -r requirements.txt >> "%LOG_FILE%" 2>&1
 
-echo [%date% %time%] Verifying icon.png exists... >> "%LOG_FILE%"
-if not exist "icon.png" (
-    echo [%date% %time%] Creating icon.png... >> "%LOG_FILE%"
-    python -c "from icon import create_default_icon; create_default_icon()" >> "%LOG_FILE%" 2>&1
-    if not exist "icon.png" (
-        echo ERROR: Failed to create icon.png >> "%LOG_FILE%"
-        echo Failed to create icon.png. Please check the logs.
-        pause
-        exit /b 1
-    )
-)
-
 if not exist "config.json" (
     echo {"speakers":[],"headphones":[],"hotkeys":{"switch_device":"ctrl+alt+s","switch_type":"ctrl+alt+t"},"current_type":"Speakers", "kernel_mode_enabled": false, "force_start": false} > config.json
 )
