@@ -44,11 +44,8 @@ def build_app():
         '--clean',
         '--noconfirm',
         '--uac-admin',
-        # Add these options
-        '--win-private-assemblies',
-        '--win-no-prefer-redirects',
-        # Exclude terminal
-        '--noconsole'
+        '--noconsole',
+        
     ])
 
     # Create empty config file

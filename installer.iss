@@ -1,6 +1,6 @@
 ; filepath: /c:/Users/tamaisme/Desktop/audio-switcher/installer.iss
 #define MyAppName "Audio Switcher"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "CatalizCSCatalizCS"
 #define MyAppExeName "AudioSwitcher.exe"
 
@@ -18,7 +18,7 @@ OutputBaseFilename=AudioSwitcher_Setup
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=admin
-SetupIconFile=icon.ico
+SetupIconFile=resources/icon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -29,7 +29,7 @@ Name: "startup"; Description: "Start with Windows"; GroupDescription: "Windows S
 
 [Files]
 Source: "dist\AudioSwitcher\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "resources\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
