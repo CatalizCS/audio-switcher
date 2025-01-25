@@ -139,23 +139,31 @@ class AudioSwitcher:
         try:
             logging.debug("Audio Switcher initialization started")
 
-            # Get application directory
-            if getattr(sys, 'frozen', False):
-                # Running as compiled
-                app_dir = os.path.dirname(sys.executable)
-                resources_dir = os.path.join(app_dir, 'resources')
+            # Get application paths
+            if getattr(sys, "frozen", False):
+                # Running as compiled executable
+                base_dir = os.path.dirname(sys.executable)
+                self.resources_dir = os.path.join(base_dir, "resources")
+                self.logs_dir = os.path.join(base_dir, "logs")
             else:
                 # Running as script
-                app_dir = os.path.dirname(os.path.abspath(__file__))
-                resources_dir = os.path.join(app_dir, 'resources')
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                self.resources_dir = os.path.join(base_dir, "resources")
+                self.logs_dir = os.path.join(base_dir, "logs")
 
-            # Check if soundvolumeview exists
-            self.soundvolumeview_path = os.path.join(resources_dir, "svcl.exe")
-            if not os.path.exists(self.soundvolumeview_path):
-                logging.error(
-                    "svcl.exe not found. Please ensure it's in the resources folder."
-                )
-                raise FileNotFoundError("svcl.exe is required but not found")
+            # Create necessary directories
+            os.makedirs(self.resources_dir, exist_ok=True)
+            os.makedirs(self.logs_dir, exist_ok=True)
+
+            # Find svcl.exe
+            self.soundvolumeview_path = self._find_resource("svcl.exe")
+            if not self.soundvolumeview_path:
+                raise FileNotFoundError("svcl.exe not found in any expected location")
+
+            # Find icon.png for tray
+            self.icon_path = self._find_resource("icon.png")
+            if not self.icon_path:
+                raise FileNotFoundError("icon.png not found in any expected location")
 
             # Initialize notification system
             try:
@@ -298,20 +306,36 @@ class AudioSwitcher:
 
     def setup_logging(self):
         """Setup logging configuration"""
-        # Create logs directory if it doesn't exist
-        if not os.path.exists("logs"):
-            os.makedirs("logs")
+        try:
+            # Use the logs directory from instance
+            if hasattr(self, "logs_dir"):
+                log_dir = self.logs_dir
+            else:
+                # Fallback to default
+                log_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "logs"
+                )
 
-        # Setup logging format and configuration
-        log_filename = (
-            f'logs/audio_switcher_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-        )
-        logging.basicConfig(
-            level=logging.DEBUG, 
-            format="%(asctime)s.%(msecs)03d - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            handlers=[logging.FileHandler(log_filename), logging.StreamHandler()],
-        )
+            os.makedirs(log_dir, exist_ok=True)
+
+            log_filename = os.path.join(
+                log_dir,
+                f'audio_switcher_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
+            )
+
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format="%(asctime)s.%(msecs)03d - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+                handlers=[logging.FileHandler(log_filename), logging.StreamHandler()],
+            )
+
+            logging.info(f"Logging initialized. Log file: {log_filename}")
+
+        except Exception as e:
+            print(f"Failed to setup logging: {e}")
+            # Set basic logging as fallback
+            logging.basicConfig(level=logging.DEBUG)
 
     def is_admin(self):
         try:
@@ -576,16 +600,15 @@ class AudioSwitcher:
                 capture_output=True,
                 text=True,
                 startupinfo=startupinfo,
-                creationflags=win32process.CREATE_NO_WINDOW
+                creationflags=win32process.CREATE_NO_WINDOW,
             )
 
             # Quick verification using Windows API
             try:
                 from pycaw.pycaw import AudioUtilities
+
                 devices = AudioUtilities.GetAllDevices()
-                default_device = next(
-                    (d for d in devices if d.id == device_id), None
-                )
+                default_device = next((d for d in devices if d.id == device_id), None)
                 if not default_device:
                     logging.warning("Device not found in default devices after setting")
                     return False
@@ -608,10 +631,14 @@ class AudioSwitcher:
             logging.debug("Setting up system tray icon...")
 
             # Get icon path from resources
-            if getattr(sys, 'frozen', False):
-                icon_path = os.path.join(os.path.dirname(sys.executable), 'resources', 'icon.png')
+            if getattr(sys, "frozen", False):
+                icon_path = os.path.join(
+                    os.path.dirname(sys.executable), "resources", "icon.png"
+                )
             else:
-                icon_path = os.path.join(os.path.dirname(__file__), 'resources', 'icon.png')
+                icon_path = os.path.join(
+                    os.path.dirname(__file__), "resources", "icon.png"
+                )
 
             if not os.path.exists(icon_path):
                 logging.error("icon.png not found in: " + os.path.abspath(icon_path))
@@ -636,7 +663,7 @@ class AudioSwitcher:
             current_device = "No device selected"
             if self.devices[self.current_type]:
                 first_device = self.devices[self.current_type][0]
-                device_idx = first_device["index"] 
+                device_idx = first_device["index"]
                 current_device = sd.query_devices(device_idx)["name"]
 
             self.icon = pystray.Icon(
@@ -713,7 +740,9 @@ class AudioSwitcher:
 
             # Update current device in tray title
             if self.devices[self.current_type]:
-                current_device = self.devices[self.current_type][self.current_device_index[self.current_type]]
+                current_device = self.devices[self.current_type][
+                    self.current_device_index[self.current_type]
+                ]
                 self.update_tray_title(current_device)
 
             # Force system tray refresh
@@ -936,7 +965,7 @@ class AudioSwitcher:
                     startupinfo=subprocess.STARTUPINFO(),
                     creationflags=win32process.CREATE_NO_WINDOW,
                     stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL
+                    stdout=subprocess.DEVNULL,
                 )
             except:
                 pass
@@ -1145,6 +1174,28 @@ class AudioSwitcher:
             self.icon.update_menu()
         except Exception as e:
             print(f"Error toggling debug mode: {e}")
+
+    def _find_resource(self, filename):
+        """Find a resource file in various locations"""
+        search_paths = [
+            os.path.join(self.resources_dir, filename),
+            os.path.join(os.path.dirname(sys.executable), "resources", filename),
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "resources", filename
+            ),
+            os.path.join(os.getcwd(), "resources", filename),
+            os.path.join(os.getcwd(), filename),
+            filename,
+        ]
+
+        for path in search_paths:
+            if os.path.exists(path):
+                logging.info(f"Found {filename} at: {path}")
+                return path
+
+        paths_str = "\n  ".join(search_paths)
+        logging.error(f"Could not find {filename} in any of:\n  {paths_str}")
+        return None
 
 
 if __name__ == "__main__":
