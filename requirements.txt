@@ -8,3 +8,7 @@ tk
 olefile
 pycaw
 pyinstaller
+requests
+packaging
+mtTkinter
+customtkinter

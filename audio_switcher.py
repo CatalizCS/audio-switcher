@@ -20,6 +20,14 @@ import win32security
 import winreg
 import win32com.client
 import win32process
+from app_mapping_gui import AppMappingGUI, run_mapping_gui_process
+import queue
+from pythoncom import CoInitialize, CoUninitialize
+import tkinter as tk
+from update_checker import UpdateChecker
+import asyncio
+from multiprocessing import Process, Queue, freeze_support
+import os.path
 
 
 class DeviceType(Enum):
@@ -85,8 +93,78 @@ class AudioDeviceListener:
             self._timer.start()
 
 
+class ProcessMonitor:
+    def __init__(self, callback):
+        self._callback = callback
+        self._running = True
+        self._current_process = None
+        self._timer = None
+        self._check_interval = 1.0  # seconds
+
+    def start(self):
+        self._schedule_check()
+
+    def stop(self):
+        self._running = False
+        if self._timer:
+            self._timer.cancel()
+
+    def _get_foreground_process(self):
+        try:
+            import win32gui
+            import win32process
+
+            hwnd = win32gui.GetForegroundWindow()
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return pid
+        except:
+            return None
+
+    def _check_process(self):
+        if not self._running:
+            return
+
+        try:
+            current_pid = self._get_foreground_process()
+            if current_pid and current_pid != self._current_process:
+                self._current_process = current_pid
+                self._callback(current_pid)
+        except Exception as e:
+            logging.error(f"Error checking process: {e}")
+        finally:
+            self._schedule_check()
+
+    def _schedule_check(self):
+        if self._running:
+            self._timer = Timer(self._check_interval, self._check_process)
+            self._timer.daemon = True
+            self._timer.start()
+
+
 class AudioSwitcher:
+    VERSION = "1.0.2"
+
     def __init__(self):
+        # Initialize single root window at the very beginning
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_root_close)
+
+        # Initialize queues first before anything else
+        self.menu_event_queue = queue.Queue()
+        self.gui_queue = queue.Queue()
+        # Add thread-safe queue for GUI operations
+        self.gui_action_queue = queue.Queue()
+
+        # Initialize event loop
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
+        # Initialize async event handling
+        self.gui_event_queue = asyncio.Queue()
+
+        # Initialize COM in main thread
+        CoInitialize()
         self._active = True
         self._error_count = 0
         self.MAX_ERRORS = 3
@@ -117,6 +195,16 @@ class AudioSwitcher:
 
         # Add new attribute for process tracking
         self._svcl_processes = set()
+
+        self.app_device_map = {}
+        self.auto_switch_enabled = False
+        self.process_monitor = None
+        self.mapping_gui = None
+        self.gui_queue = queue.Queue()
+
+        # Make sure root processes events
+        self.root.update_idletasks()
+        self.root.update()
 
         # Now load config which may override defaults
         self.load_config()
@@ -199,12 +287,82 @@ class AudioSwitcher:
             self.device_listener = AudioDeviceListener(self._handle_device_change)
             self.device_listener.start()
 
+            # Initialize process monitor if auto-switch is enabled
+            if self.auto_switch_enabled:
+                self.start_process_monitor()
+
+            # Initialize Tkinter root window
+            self.root.withdraw()
+
+            # Initialize update checker
+            self.update_checker = UpdateChecker(self.VERSION)
+            self.check_for_updates()
+
             logging.info("Initialization completed successfully")
 
         except Exception as e:
             logging.critical(f"Initialization failed: {e}\n{traceback.format_exc()}")
             self.cleanup()
             sys.exit(1)
+
+        # Start async event processing
+        self.loop.create_task(self._process_gui_events())
+
+        # Create GUI thread for handling Tkinter operations
+        self.gui_thread = Thread(target=self._run_gui_loop, daemon=True)
+        self.gui_thread.start()
+
+        # Wait for GUI thread to initialize
+        time.sleep(0.1)
+
+        self.gui_process = None
+        self.gui_queue = Queue()  # For communication with GUI process
+
+        # Add freeze support for Windows
+        if __name__ == "__main__":
+            freeze_support()
+
+        self._last_config_modified = (
+            os.path.getmtime(self.config_file)
+            if os.path.exists(self.config_file)
+            else 0
+        )
+
+    async def _process_gui_events(self):
+        """Process GUI events asynchronously"""
+        while self._active:
+            try:
+                # Process Tkinter events safely
+                if self.root and self.root.winfo_exists():
+                    self.root.update()
+
+                # Small delay to prevent CPU overuse
+                await asyncio.sleep(0.01)
+
+            except tk.TclError as e:
+                if "application has been destroyed" not in str(e):
+                    logging.error(f"Tkinter error: {e}")
+            except Exception as e:
+                logging.error(f"Error in event processing: {e}")
+
+    def _run_gui_loop(self):
+        """Run Tkinter event loop in a dedicated thread"""
+        try:
+            while self._active:
+                if self.root and self.root.winfo_exists():
+                    try:
+                        self.root.update()
+                        # Check config file every second
+                        self._check_config_changes()
+                        time.sleep(0.1)  # Prevent high CPU usage
+                    except tk.TclError as e:
+                        if "application has been destroyed" not in str(e):
+                            logging.error(f"Tkinter error in GUI loop: {e}")
+                            break
+                else:
+                    break
+        except Exception as e:
+            logging.error(f"Error in GUI loop: {e}")
 
     def _load_debug_setting(self):
         """Load debug mode setting from config"""
@@ -381,16 +539,48 @@ class AudioSwitcher:
                 self.current_type = DeviceType(
                     config.get("current_type", DeviceType.SPEAKER.value)
                 )
+
+                # Load new settings with proper conversion
+                self.app_device_map.clear()  # Clear existing mappings
+                raw_mappings = config.get("app_device_map", {})
+                for app, settings in raw_mappings.items():
+                    if isinstance(settings, dict):
+                        self.app_device_map[app] = {
+                            "type": str(settings.get("type", "Speakers")),
+                            "device_id": str(settings.get("device_id", "")),
+                            "disabled": bool(settings.get("disabled", False)),
+                        }
+                    else:
+                        # Handle legacy format
+                        self.app_device_map[app] = {
+                            "type": "Speakers",
+                            "device_id": str(settings),
+                            "disabled": False,
+                        }
+
+                logging.info(f"Loaded {len(self.app_device_map)} application mappings")
+                logging.debug(f"Loaded mappings: {self.app_device_map}")
+
         except FileNotFoundError:
             # Set defaults for new settings
             self.kernel_mode_enabled = True
             self.force_start = False
             self.debug_mode = False
+            self.app_device_map = {}
+            self.auto_switch_enabled = False
             self.save_config()
 
     def save_config(self):
-        with open(self.config_file, "w") as f:
-            json.dump(
+        """Save configuration with validation and backup"""
+        try:
+            # Load current config first
+            current_config = {}
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    current_config = json.load(f)
+
+            # Merge our changes with current config
+            current_config.update(
                 {
                     "speakers": self.devices[DeviceType.SPEAKER],
                     "headphones": self.devices[DeviceType.HEADPHONE],
@@ -398,16 +588,96 @@ class AudioSwitcher:
                     "current_type": self.current_type.value,
                     "kernel_mode_enabled": self.kernel_mode_enabled,
                     "force_start": self.force_start,
-                    "debug_mode": self.debug_mode,  # Save debug mode setting
-                },
-                f,
-                indent=4,
+                    "debug_mode": self.debug_mode,
+                    "auto_switch_enabled": self.auto_switch_enabled,
+                    "app_device_map": {
+                        app: {
+                            "type": str(settings["type"]),
+                            "device_id": str(settings["device_id"]),
+                            "disabled": bool(settings.get("disabled", False)),
+                        }
+                        for app, settings in current_config.get(
+                            "app_device_map", {}
+                        ).items()
+                    },
+                }
             )
+
+            logging.debug(f"Current config state: {current_config}")
+
+            # Create backup of existing config
+            if os.path.exists(self.config_file):
+                backup_file = f"{self.config_file}.bak"
+                try:
+                    os.replace(self.config_file, backup_file)
+                except Exception as e:
+                    logging.warning(f"Failed to create backup: {e}")
+
+            # Save merged config
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(current_config, f, indent=4, ensure_ascii=False)
+
+            # Verify the save
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                saved_data = json.load(f)
+                saved_mappings = len(saved_data.get("app_device_map", {}))
+                logging.info(
+                    f"Config saved successfully with {saved_mappings} mappings"
+                )
+                if os.path.exists(backup_file):
+                    os.remove(backup_file)
+
+            # Update last modified time
+            self._last_config_modified = os.path.getmtime(self.config_file)
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to save config: {e}", exc_info=True)
+            return False
+
+    def reload_config(self):
+        """Reload configuration from file"""
+        try:
+            logging.info("Reloading configuration")
+            old_map = self.app_device_map.copy()
+
+            # Load fresh config
+            with open(self.config_file, "r") as f:
+                config = json.load(f)
+
+            # Update app mappings
+            self.app_device_map.clear()
+            raw_mappings = config.get("app_device_map", {})
+            for app, settings in raw_mappings.items():
+                if isinstance(settings, dict):
+                    self.app_device_map[app] = {
+                        "type": str(settings.get("type", "Speakers")),
+                        "device_id": str(settings.get("device_id", "")),
+                        "disabled": bool(settings.get("disabled", False)),
+                    }
+
+            if self.app_device_map != old_map:
+                logging.info(
+                    f"Updated mappings from config: {len(self.app_device_map)} entries"
+                )
+                logging.debug(f"New mappings: {self.app_device_map}")
+                self._last_config_modified = os.path.getmtime(self.config_file)
+                self._refresh_interface()  # Update UI
+                return True
+
+            return False
+
+        except Exception as e:
+            logging.error(f"Failed to reload config: {e}", exc_info=True)
+            return False
 
     def get_audio_devices(self):
         """Get audio devices using Windows Audio API directly"""
         output_devices = []
         try:
+            # Ensure COM is initialized for this thread
+            CoInitialize()
+
             # Get enumerator interface
             from pycaw.pycaw import AudioUtilities, EDataFlow
             from comtypes import CLSCTX_ALL, cast, POINTER
@@ -447,6 +717,9 @@ class AudioSwitcher:
         except Exception as e:
             logging.error(f"Error enumerating audio devices: {e}")
             logging.error(traceback.format_exc())
+        finally:
+            # Clean up COM
+            CoUninitialize()
 
         if not output_devices:
             # Debug logging
@@ -524,16 +797,46 @@ class AudioSwitcher:
         self.icon.title = f"Current {self.current_type.value}: {device_name}"
 
     def _process_notifications(self):
-        """Process notifications in the main thread"""
-        if self._active and hasattr(self, "notifier") and self.notifier:
+        """Process GUI events and notifications"""
+        if self._active and self.root and self.root.winfo_exists():
             try:
-                self.notifier.process_events()
+                # Process Tkinter events
+                self.root.update()
+
+                # Process GUI actions
+                self._process_gui_actions()
+
+            except tk.TclError as e:
+                if "application has been destroyed" not in str(e):
+                    logging.error(f"Tkinter error: {e}")
             except Exception as e:
-                if self._active:  # Only log if not shutting down
-                    logging.error(f"Error processing notifications: {e}")
-                    self._error_count += 1
-                    if self._error_count >= self.MAX_ERRORS:
-                        self.cleanup()
+                logging.error(f"Error in event processing: {e}")
+
+    def _process_gui_actions(self):
+        """Process queued GUI actions"""
+        try:
+            while True:  # Process all pending actions
+                action = self.gui_action_queue.get_nowait()
+                if action == "show_mapping":
+                    self._create_mapping_gui_safe()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logging.error(f"Error processing GUI action: {e}")
+
+    def _process_menu_events(self):
+        """Process queued menu events"""
+        try:
+            while True:
+                try:
+                    action = self.menu_event_queue.get_nowait()
+                    if action == "show_mapping":
+                        if self.root and self.root.winfo_exists():
+                            self._create_mapping_gui_safe()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logging.error(f"Error processing menu events: {e}")
 
     def show_notification(self, title, message):
         """Show both tray and overlay notifications with error handling"""
@@ -693,6 +996,8 @@ class AudioSwitcher:
     def _run_tray(self):
         """Run tray icon in a separate thread with COM initialization"""
         try:
+            # Initialize COM in tray thread
+            CoInitialize()
             logging.debug("Starting tray icon loop in thread")
             self.icon.run()
             logging.debug("Tray icon loop ended normally")
@@ -701,6 +1006,9 @@ class AudioSwitcher:
             self._error_count += 1
             if self._error_count >= self.MAX_ERRORS:
                 self.cleanup()
+        finally:
+            # Clean up COM
+            CoUninitialize()
 
     def create_fallback_menu(self):
         """Create a minimal fallback menu"""
@@ -774,18 +1082,14 @@ class AudioSwitcher:
                         ].get("id")
                     )
 
-                    # Get base name without group prefix
                     name = device["name"].replace(group_name, "").strip()
 
-                    # Count occurrences of this name
                     if name in name_counter:
                         name_counter[name] += 1
-                        # Add a number suffix to duplicate names
                         name = f"{name} ({name_counter[name]})"
                     else:
                         name_counter[name] = 1
 
-                    # Add status indicators
                     if is_current:
                         name = f"▶ {name}"
                     elif is_active:
@@ -815,7 +1119,6 @@ class AudioSwitcher:
                         )
                     ]
 
-                # Group devices by manufacturer
                 groups = {}
                 for device in devices:
                     group = device["name"].split(" ", 1)[0]
@@ -836,7 +1139,6 @@ class AudioSwitcher:
                     )
                 return menu_items
 
-            # Create main menu structure
             menu_items = [
                 pystray.MenuItem(
                     text=f"● {self.current_type.value}", action=None, enabled=False
@@ -878,12 +1180,32 @@ class AudioSwitcher:
                             action=lambda _: self.toggle_debug_mode(),
                             checked=lambda _: self.debug_mode,
                         ),
+                        pystray.Menu.SEPARATOR,
+                        pystray.MenuItem(
+                            text="🔄 Auto-Switch",
+                            action=lambda _: self.toggle_auto_switch(),
+                            checked=lambda _: self.auto_switch_enabled,
+                        ),
+                        pystray.MenuItem(
+                            text="⚙️ Configure App Mappings",
+                            action=lambda _: self.show_mapping_gui(),
+                        ),
                     ),
                 ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(
                     text="❌ Exit", action=lambda _: self.cleanup_and_exit()
                 ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(
+                    text=f"⏳ Version {self.VERSION}",
+                    action=lambda _: self.update_checker.open_download_page(),
+                ),
+                pystray.MenuItem(
+                    text="🔄 Check for Updates",
+                    action=lambda _: self.check_for_updates(),
+                ),
+                pystray.MenuItem(text="ℹ️ Made by Tamaisme", action=None, enabled=False),
             ]
 
             return pystray.Menu(*menu_items)
@@ -940,7 +1262,7 @@ class AudioSwitcher:
 
         except Exception as e:
             logging.error(f"Error toggling device: {e}", exc_info=True)
-            self.show_notification("Error", f"Failed to update device: {str(e)}")
+            self.show_notification("Error", f"Failed to update device: {e}")
             return False
 
     def cleanup_and_exit(self):
@@ -982,12 +1304,34 @@ class AudioSwitcher:
             if hasattr(self, "device_listener"):
                 self.device_listener.stop()
 
+            # Stop process monitor
+            if self.process_monitor:
+                self.process_monitor.stop()
+                self.process_monitor = None
+
             # Unhook keyboard
             keyboard.unhook_all()
 
             # Stop tray icon last
             if hasattr(self, "icon"):
                 self.icon.stop()
+
+            # Destroy root window
+            if hasattr(self, "root"):
+                self.root.quit()
+                self.root.destroy()
+
+            # Wait for GUI thread to finish
+            if hasattr(self, "gui_thread") and self.gui_thread.is_alive():
+                self.gui_thread.join(timeout=1.0)
+
+            # Terminate GUI process if running
+            if self.gui_process and self.gui_process.is_alive():
+                self.gui_process.terminate()
+                self.gui_process.join(timeout=1.0)
+
+            # Clean up COM at the end
+            CoUninitialize()
 
             logging.info("Cleanup completed successfully")
         except Exception as e:
@@ -1189,7 +1533,7 @@ class AudioSwitcher:
         ]
 
         for path in search_paths:
-            if os.path.exists(path):
+            if path:
                 logging.info(f"Found {filename} at: {path}")
                 return path
 
@@ -1197,22 +1541,425 @@ class AudioSwitcher:
         logging.error(f"Could not find {filename} in any of:\n  {paths_str}")
         return None
 
+    def start_process_monitor(self):
+        if not self.process_monitor:
+            self.process_monitor = ProcessMonitor(self._handle_process_change)
+            self.process_monitor.start()
+
+    def stop_process_monitor(self):
+        if self.process_monitor:
+            self.process_monitor.stop()
+            self.process_monitor = None
+
+    def _handle_process_change(self, pid):
+        """Handle foreground process changes with window title matching"""
+        try:
+            # Check if config has changed
+            if self._check_config_changes():
+                logging.info("Config changed, reloading settings")
+                self._force_reload_config()
+                
+            import psutil
+            import win32gui
+            import win32process
+
+            # Get process name
+            process = psutil.Process(pid)
+            process_name = process.name().lower()
+            process_base_name = os.path.splitext(process_name)[0]  # Remove extension
+
+            # Get window title
+            def get_window_title(hwnd):
+                if win32process.GetWindowThreadProcessId(hwnd)[1] == pid:
+                    return win32gui.GetWindowText(hwnd).lower()
+                return None
+
+            window_title = None
+            win32gui.EnumWindows(
+                lambda hwnd, _: (
+                    setattr(process, "_window_title", get_window_title(hwnd))
+                    if get_window_title(hwnd)
+                    else None
+                ),
+                None,
+            )
+            window_title = getattr(process, "_window_title", "").lower()
+
+            logging.debug(
+                f"Active window - Process: {process_name} ({process_base_name}), Title: {window_title}"
+            )
+
+            for app_pattern, device_config in self.app_device_map.items():
+                if device_config.get("disabled", False):
+                    continue
+
+                pattern = app_pattern.lower()
+                pattern_parts = pattern.split()
+
+                def all_parts_match(target):
+                    return all(part in target for part in pattern_parts)
+
+                is_match = (
+                    pattern == process_name
+                    or pattern == process_base_name
+                    or (len(pattern) > 3 and pattern in process_base_name)
+                    or (
+                        window_title
+                        and (
+                            pattern == window_title
+                            or (
+                                len(pattern_parts) > 1 and all_parts_match(window_title)
+                            )
+                            or (len(pattern) > 3 and pattern in window_title)
+                        )
+                    )
+                )
+
+                if is_match:
+                    device_type = DeviceType(device_config["type"])
+                    device_id = device_config["device_id"]
+
+                    device = next(
+                        (
+                            d
+                            for d in self.devices[device_type]
+                            if d.get("id") == device_id
+                        ),
+                        None,
+                    )
+
+                    if device:
+                        # Switch to this device
+                        self.current_type = device_type
+                        self.set_default_audio_device(device)
+                        match_type = (
+                            "process name"
+                            if pattern in process_name
+                            else "window title"
+                        )
+                        self.show_notification(
+                            "Auto-Switched Device",
+                            f"Switched to {device.get('name')} for {match_type}: {app_pattern}",
+                        )
+                        self._refresh_interface()
+                        break
+
+        except Exception as e:
+            logging.error(f"Error handling process change: {e}", exc_info=True)
+
+    def toggle_auto_switch(self):
+        """Toggle automatic device switching"""
+        try:
+            self.auto_switch_enabled = not self.auto_switch_enabled
+
+            if self.auto_switch_enabled:
+                self.start_process_monitor()
+                message = "Automatic switching enabled"
+            else:
+                self.stop_process_monitor()
+                message = "Automatic switching disabled"
+
+            self.save_config()
+            self.show_notification("Auto-Switch", message)
+            self._refresh_interface()
+
+        except Exception as e:
+            logging.error(f"Error toggling auto-switch: {e}")
+            self.show_notification("Error", "Failed to toggle automatic switching")
+
+    def get_icon_path(self):
+        """Get path to icon file"""
+        if hasattr(self, "icon_path") and self.icon_path:
+            # Return ICO version if it exists
+            ico_path = self.icon_path.replace(".png", ".ico")
+            if os.path.exists(ico_path):
+                return ico_path
+            return self.icon_path
+        return None
+
+    def show_mapping_gui(self):
+        """Launch mapping GUI in a separate process with data passing"""
+        try:
+            if not self._active:
+                return
+
+            # Kill any existing GUI process
+            if self.gui_process and self.gui_process.is_alive():
+                self.gui_process.terminate()
+                self.gui_process.join()
+
+            # Create fresh queue and prepare data
+            self.gui_queue = Queue()
+
+            # Add icon path to GUI data
+            icon_path = self.get_icon_path()
+            
+            gui_data = {
+                "devices": {
+                    "Speakers": [d.copy() for d in self.devices[DeviceType.SPEAKER]],
+                    "Headphones": [d.copy() for d in self.devices[DeviceType.HEADPHONE]],
+                },
+                "app_device_map": {
+                    app: {
+                        "type": str(config.get("type", "Speakers")),
+                        "device_id": str(config.get("device_id", "")),
+                        "disabled": bool(config.get("disabled", False)),
+                    }
+                    for app, config in self.app_device_map.items()
+                },
+                "device_types": {"SPEAKER": "Speakers", "HEADPHONE": "Headphones"},
+                "icon_path": icon_path  # Add icon path to data
+            }
+
+            # Launch GUI process
+            self.gui_process = Process(
+                target=run_mapping_gui_process, args=(gui_data, self.gui_queue)
+            )
+            self.gui_process.daemon = True
+            self.gui_process.start()
+
+            # Start monitoring the queue in main thread
+            self.root.after(100, self._check_gui_queue)
+
+        except Exception as e:
+            logging.error(f"Error launching GUI process: {e}", exc_info=True)
+
+    def _check_gui_queue(self):
+        """Check GUI queue in main thread"""
+        if not self._active:
+            return
+
+        try:
+            while True:
+                try:
+                    action, data = self.gui_queue.get_nowait()
+                    logging.debug(f"Received GUI message: {action} with data: {data}")
+
+                    if action == "update_mapping" and isinstance(data, dict):
+                        try:
+                            if self._validate_mapping_data(data):
+                                # Update mappings
+                                self.app_device_map = {}
+                                for app, config in data.items():
+                                    self.app_device_map[app] = {
+                                        "type": str(config["type"]),
+                                        "device_id": str(config["device_id"]),
+                                        "disabled": bool(config.get("disabled", False)),
+                                    }
+
+                                # Save and reload config
+                                if self.save_config():
+                                    if self.reload_config():
+                                        logging.info(
+                                            "Configuration updated and reloaded"
+                                        )
+                                    else:
+                                        logging.error("Failed to reload configuration")
+                                else:
+                                    raise Exception("Failed to save configuration")
+
+                            else:
+                                raise ValueError("Invalid mapping data received")
+
+                        except Exception as e:
+                            logging.error(
+                                f"Error updating mappings: {e}", exc_info=True
+                            )
+                            self.show_notification("Error", "Failed to update mappings")
+
+                    elif action == "force_reload":
+                        self._force_reload_config()
+
+                    elif action == "force_save":
+                        if self.save_config() and self.reload_config():
+                            logging.info("Force save and reload successful")
+                        else:
+                            self.show_notification(
+                                "Error", "Failed to save configuration"
+                            )
+
+                except queue.Empty:
+                    break
+
+            # Schedule next check if GUI is active
+            if self.gui_process and self.gui_process.is_alive():
+                self.root.after(100, self._check_gui_queue)
+
+        except Exception as e:
+            logging.error(f"Error in GUI queue handler: {e}", exc_info=True)
+
+    def _validate_mapping_data(self, data):
+        """Validate mapping data from GUI"""
+        try:
+            if not isinstance(data, dict):
+                logging.error("Mapping data is not a dictionary")
+                return False
+
+            for app, config in data.items():
+                if not isinstance(config, dict):
+                    logging.error(f"Invalid config for app {app}")
+                    return False
+
+                # Check required fields
+                if "type" not in config:
+                    logging.error(f"Missing type in config for app {app}")
+                    return False
+                if "device_id" not in config:
+                    logging.error(f"Missing device_id in config for app {app}")
+                    return False
+
+                # Validate field types
+                if not isinstance(config["type"], str):
+                    logging.error(f"Invalid type format for app {app}")
+                    return False
+                if not isinstance(config["device_id"], (str, int)):
+                    logging.error(f"Invalid device_id format for app {app}")
+                    return False
+                if "disabled" in config and not isinstance(config["disabled"], bool):
+                    logging.error(f"Invalid disabled format for app {app}")
+                    return False
+
+            logging.debug(f"Validated mapping data: {data}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Validation error: {e}", exc_info=True)
+            return False
+
+    def _create_mapping_gui_safe(self):
+        """Create mapping GUI safely in main thread"""
+        try:
+            if not self.root or not self.root.winfo_exists():
+                logging.error("Root window not available")
+                return
+
+            if (
+                not hasattr(self, "mapping_gui")
+                or not self.mapping_gui
+                or not hasattr(self.mapping_gui, "window")
+                or not self.mapping_gui.window.winfo_exists()
+            ):
+
+                logging.debug("Creating new mapping GUI")
+                self.mapping_gui = AppMappingGUI(self, DeviceType)
+                self.mapping_gui.window.lift()
+                self.mapping_gui.window.focus_force()
+                logging.debug("Mapping GUI created successfully")
+            else:
+                logging.debug("Reusing existing mapping GUI")
+                self.mapping_gui.window.lift()
+                self.mapping_gui.window.focus_force()
+
+        except Exception as e:
+            logging.error(f"Error creating mapping GUI: {e}")
+            self.show_notification("Error", "Failed to open mapping configuration")
+
+    def check_for_updates(self):
+        """Check for available updates"""
+        try:
+            if self.update_checker.check_for_updates():
+                self.show_notification(
+                    "Update Available",
+                    f"Version {self.update_checker.latest_version} is available",
+                )
+        except Exception as e:
+            logging.error(f"Error checking for updates: {e}")
+
+    def _on_root_close(self):
+        """Handle root window close"""
+        if self._active:
+            self.cleanup()
+
+    def _queue_menu_action(self, action):
+        """Queue menu action for later processing"""
+        try:
+            self.menu_event_queue.put_nowait(action)
+        except Exception as e:
+            logging.error(f"Error queueing menu action: {e}")
+
+    def _handle_menu_action(self, action):
+        """Deprecated - use _process_menu_events instead"""
+        pass
+
+    def _check_config_changes(self):
+        """Check if config file has been modified externally"""
+        try:
+            if not os.path.exists(self.config_file):
+                return False
+
+            current_mtime = os.path.getmtime(self.config_file)
+            if current_mtime > self._last_config_modified:
+                logging.info("Config file changed externally, reloading...")
+                self._last_config_modified = current_mtime
+                return self.reload_config()
+            return False
+        except Exception as e:
+            logging.error(f"Error checking config changes: {e}")
+            return False
+
+    def _force_reload_config(self):
+        """Force reload configuration and update monitoring"""
+        try:
+            logging.info("Force reloading configuration")
+            
+            # Store old state for comparison
+            old_map = self.app_device_map.copy()
+            old_auto_switch = self.auto_switch_enabled
+            
+            # Reload configuration
+            if self.reload_config():
+                # Check if auto-switch status changed
+                if self.auto_switch_enabled != old_auto_switch:
+                    if self.auto_switch_enabled:
+                        self.start_process_monitor()
+                    else:
+                        self.stop_process_monitor()
+                
+                # If app mappings changed and monitoring is active, refresh
+                if old_map != self.app_device_map and self.process_monitor:
+                    self.stop_process_monitor()
+                    self.start_process_monitor()
+                
+                self.show_notification(
+                    "Configuration Reloaded",
+                    "Settings updated successfully"
+                )
+                return True
+            
+            self.show_notification(
+                "Reload Failed",
+                "Failed to reload configuration"
+            )
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error force reloading config: {e}")
+            self.show_notification("Error", "Failed to reload configuration")
+            return False
+
 
 if __name__ == "__main__":
     try:
+        freeze_support()
         app = AudioSwitcher()
-        logging.info("Application started, entering main loop")
+        logging.info("Application started")
 
-        # Main event loop that processes both tray and notifications
-        while app._active and app.tray_thread.is_alive():
+        # Main event loop
+        while app._active:
             try:
-                app._process_notifications()
+                app.root.update()
                 time.sleep(0.01)
-            except KeyboardInterrupt:
-                logging.info("Received keyboard interrupt")
+
+                # Check tray thread
+                if not app.tray_thread.is_alive():
+                    break
+
+            except tk.TclError as e:
+                if "application has been destroyed" not in str(e):
+                    logging.error(f"Main loop error: {e}")
                 break
             except Exception as e:
-                logging.error(f"Main loop error: {e}", exc_info=True)
+                logging.error(f"Main loop error: {e}")
                 break
 
     except Exception as e:
