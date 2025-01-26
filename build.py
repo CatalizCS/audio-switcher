@@ -86,7 +86,7 @@ def build_app():
     if not os.path.exists(config_path):
         with open(config_path, "w") as f:
             f.write(
-                '{"speakers":[],"headphones":[],"hotkeys":{"switch_device":"ctrl+alt+s","switch_type":"ctrl+alt+t"}, "kernel_mode_enabled": true, "force_start": false,"debug_mode":false}'
+                '{"speakers":[],"headphones":[],"hotkeys":{"switch_device":"ctrl+alt+s","switch_type":"ctrl+alt+t"}, "kernel_mode_enabled": true, "force_start": false,"debug_mode":false,"auto_switch_enabled": true, "app_device_map": "{}"}'
             )
 
     # Clean up temp directory
