@@ -26,24 +26,26 @@ class OverlayNotification:
             self.root.protocol("WM_DELETE_WINDOW", self.destroy)
             self.root.wm_attributes("-topmost", True)
 
-            # Configure modern styles
+            # Updated modern styles with new color scheme
             style = ttk.Style(self.root)
             style.configure(
                 "Custom.TLabel",
-                font=("Segoe UI", 11),
-                background="#2D2D2D",
-                foreground="#FFFFFF",
-                padding=8,
+                font=("Segoe UI", 10),
+                background="#2B2B2B",
+                foreground="#E8E8E8",
+                padding=6,
             )
             style.configure(
                 "Title.TLabel",
-                font=("Segoe UI", 12, "bold"),
-                background="#2D2D2D",
+                font=("Segoe UI Semibold", 11),
+                background="#2B2B2B",
                 foreground="#FFFFFF",
-                padding=(8, 8, 8, 4),
+                padding=(6, 6, 6, 2),
             )
             style.configure(
-                "Custom.TFrame", background="#2D2D2D", borderwidth=1, relief="solid"
+                "Custom.TFrame",
+                background="#2B2B2B",
+                borderwidth=0,
             )
 
             logging.debug("Notification system initialized")
@@ -84,67 +86,115 @@ class OverlayNotification:
         try:
             self.is_showing = True
 
-            # Create notification window
             window = tk.Toplevel(self.root)
             window.overrideredirect(True)
             window.attributes("-topmost", True)
-            window.configure(bg="#2D2D2D")
 
-            # Add rounded corners effect
-            window.attributes("-transparentcolor", "#2D2D2D")
+            # Enhanced shadow and border effect
+            window.configure(bg="#1A1A1A")
+            window.attributes("-transparentcolor", "#1A1A1A")
 
-            # Main frame with padding
-            frame = ttk.Frame(window, style="Custom.TFrame", padding=(15, 10, 15, 12))
+            # Create rounded frame with border
+            content_frame = tk.Frame(
+                window,
+                bg="#2B2B2B",
+                highlightbackground="#3B3B3B",
+                highlightthickness=1,
+            )
+            content_frame.pack(padx=3, pady=3)
+
+            # Create inner frame with additional styling
+            inner_frame = tk.Frame(
+                content_frame,
+                bg="#2B2B2B",
+                padx=2,
+                pady=2,
+            )
+            inner_frame.pack(fill="both", expand=True)
+
+            # Main content frame with rounded corners
+            frame = ttk.Frame(
+                inner_frame, style="Custom.TFrame", padding=(12, 8, 12, 8)
+            )
             frame.pack(expand=True, fill="both")
 
-            # Icon frame for type indicator
-            icon_text = "🔊" if "speaker" in title.lower() else "🎧"
-            icon_label = ttk.Label(
-                frame, text=icon_text, style="Title.TLabel", font=("Segoe UI", 14)
-            )
-            icon_label.pack(side="left", padx=(0, 10))
+            def create_rounded_frame(parent, bg_color="#2B2B2B", corner_radius=10):
+                canvas = tk.Canvas(
+                    parent,
+                    bg=bg_color,
+                    highlightthickness=0,
+                    width=400,
+                    height=200,
+                )
+                canvas.pack(expand=True, fill="both")
 
-            # Text frame for title and message
-            text_frame = ttk.Frame(frame, style="Custom.TFrame")
+                # Create rounded rectangle
+                canvas.create_rectangle(
+                    corner_radius,
+                    corner_radius,
+                    canvas.winfo_reqwidth() - corner_radius,
+                    canvas.winfo_reqheight() - corner_radius,
+                    fill=bg_color,
+                    outline=bg_color,
+                )
+                return canvas
+
+            rounded_canvas = create_rounded_frame(frame)
+
+            # Rest of the content (icon and text) now goes on the canvas
+            icon_text = "🔊" if "speaker" in title.lower() else "🎧"
+            icon_label = tk.Label(
+                rounded_canvas,
+                text=icon_text,
+                font=("Segoe UI", 13),
+                bg="#2B2B2B",
+                fg="#FFFFFF",
+            )
+            icon_label.pack(side="left", padx=(8, 8))
+
+            # Text container
+            text_frame = tk.Frame(rounded_canvas, bg="#2B2B2B")
             text_frame.pack(side="left", fill="both", expand=True)
 
-            # Title with bottom padding
-            title_label = ttk.Label(text_frame, text=title, style="Title.TLabel")
-            title_label.pack(anchor="w", pady=(0, 2))
+            # Title label
+            title_label = tk.Label(
+                text_frame,
+                text=title,
+                font=("Segoe UI Semibold", 11),
+                bg="#2B2B2B",
+                fg="#FFFFFF",
+            )
+            title_label.pack(anchor="w", pady=(0, 1))
 
-            # Message with custom wrapping
-            msg_label = ttk.Label(
-                text_frame, text=message, style="Custom.TLabel", wraplength=300
+            # Message label
+            msg_label = tk.Label(
+                text_frame,
+                text=message,
+                font=("Segoe UI", 10),
+                bg="#2B2B2B",
+                fg="#E8E8E8",
+                wraplength=250,
             )
             msg_label.pack(anchor="w")
 
-            # Position window - MODIFIED FOR CENTER BOTTOM
             window.update_idletasks()
-            width = window.winfo_width() + 20  # Add padding
-            height = window.winfo_height() + 10  # Add padding
-
-            # Calculate center position
+            width = window.winfo_width() + 16
+            height = window.winfo_height() + 8
             screen_width = window.winfo_screenwidth()
             screen_height = window.winfo_screenheight()
-
-            # Center horizontally, position at bottom with 60px margin
             x = (screen_width - width) // 2
-            y = screen_height - height - 60  # 60px from bottom
+            y = screen_height - height - 50
 
-            window.geometry(f"+{x}+{y}")
-
-            # Smooth fade in with slide - FASTER ANIMATION
             window.attributes("-alpha", 0)
             original_y = y
-            slide_distance = 15  # Reduced from 20
+            slide_distance = 15
 
-            # Faster fade in (reduced iterations and sleep time)
-            for i in range(6):  # Reduced from 11
+            for i in range(6):
                 current_y = int(original_y + (slide_distance * (5 - i) / 5))
                 window.geometry(f"+{x}+{current_y}")
                 window.attributes("-alpha", i / 5)
                 window.update()
-                time.sleep(0.01)  # Reduced from 0.02
+                time.sleep(0.01)
 
             # Force full opacity at end
             window.attributes("-alpha", 1)
@@ -154,7 +204,7 @@ class OverlayNotification:
             def fade_out():
                 try:
                     # Faster fade out
-                    for i in range(5, -1, -1):  # Reduced from 10
+                    for i in range(5, -1, -1):
                         if window.winfo_exists():
                             window.attributes("-alpha", i / 5)
                             current_y = int(original_y + (slide_distance * (5 - i) / 5))
